@@ -1,16 +1,17 @@
 """
-Runtime orchestrator — Phase 2.
+Runtime orchestrator — Phase 3.
 
     NL query
-       -> QueryParser (Gemini structured output, offline keyword fallback)
+       -> QueryParser (structured output; offline keyword fallback)
        -> HTNPlanner (per-task method selection with EDAM type checks)
+       -> OnlineLearner (ChatHTN: propose->verify->persist when gap detected)
        -> WorkflowCompiler (gxformat2 YAML)
-       -> optional file output
 
 Usage:
     python main.py "call variants on paired-end human exome data"
-    python main.py "RNA-seq differential expression in mouse" --out workflow.gxwf.yml
-    python main.py --task "Variant Calling"                   # single-task shortcut
+    python main.py --task "Variant Calling"
+    python main.py --task "A_Totally_New_Task" --learn
+    python main.py --feedback --tools fastp,BWA-MEM,Call_variants --outcome success
 """
 
 import argparse
@@ -19,6 +20,8 @@ from src.pln.reasoner import PLNReasoner
 from src.htn.planner import HTNPlanner
 from src.parsing.parser import QueryParser
 from src.galaxy.compiler import WorkflowCompiler
+from src.htn.online_learner import OnlineLearner
+from src.htn.feedback import FeedbackLearner
 
 
 def _cmd_task(args, reasoner):
@@ -29,6 +32,14 @@ def _cmd_task(args, reasoner):
         for i, p in enumerate(plans, 1):
             print(f"[{i}] {p.render()}\n")
         return
+
+    if args.learn:
+        learner = OnlineLearner(reasoner, planner)
+        report = learner.plan_with_learning(args.task)
+        print("\n=== LEARNING REPORT ===")
+        print(report.render())
+        return
+
     plan = planner.plan(args.task)
     print(f"\n{plan.render()}")
 
@@ -39,16 +50,28 @@ def _cmd_query(args, reasoner):
     print(f"\n[1/3] PARSED\n{parsed.render()}")
 
     planner = HTNPlanner(reasoner)
-    report = planner.plan_tasks(parsed.tasks or [])
-    print(f"\n[2/3] PLANNED\n{report.render()}")
 
-    if not report.plans or not any(p.ok for p in report.plans):
+    if args.learn:
+        learner = OnlineLearner(reasoner, planner)
+        plans = []
+        for task in parsed.tasks or []:
+            report = learner.plan_with_learning(task)
+            if report.gap_detected:
+                print(f"\n  [gap] filled for {task} (accepted={report.accepted})")
+            if report.final_plan and report.final_plan.ok:
+                plans.append(report.final_plan)
+    else:
+        report = planner.plan_tasks(parsed.tasks or [])
+        plans = [p for p in report.plans if p.ok]
+        print(f"\n[2/3] PLANNED\n{report.render()}")
+
+    if not plans:
         print("\n[abort] no plannable tasks")
         return
 
     compiler = WorkflowCompiler(reasoner)
     compiled = compiler.compile(
-        [p for p in report.plans if p.ok],
+        plans,
         workflow_name=args.name or "htn_generated_workflow",
         annotation=f"Generated from query: {parsed.raw_query!r}",
     )
@@ -64,18 +87,50 @@ def _cmd_query(args, reasoner):
         path = compiled.write(args.out)
         print(f"  wrote gxformat2 YAML -> {path}")
     else:
-        print("\n--- gxformat2 YAML ---")
-        print(compiled.yaml)
+        print("\n--- gxformat2 YAML (truncated) ---")
+        print(compiled.yaml[:1500])
+        if len(compiled.yaml) > 1500:
+            print("...")
+
+
+def _cmd_feedback(args, reasoner):
+    tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    if not tools:
+        print("[feedback] no tools provided")
+        return
+    learner = FeedbackLearner(reasoner)
+    results = learner.record_workflow(tools, args.outcome)
+    print(f"\n=== FEEDBACK: {args.outcome} over {len(tools)} tools ===")
+    for r in results:
+        print(r.render())
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("query", nargs="?", help="Natural-language workflow request")
-    ap.add_argument("--task", help="Shortcut: plan a single task type directly")
+    ap.add_argument("--task", help="Plan a single task type directly")
     ap.add_argument("--alternatives", type=int, default=0)
     ap.add_argument("--out", help="Write gxformat2 YAML to this path")
-    ap.add_argument("--name", help="Override workflow name")
-    ap.add_argument("--no-llm", action="store_true", help="Force offline parser")
+    ap.add_argument("--name", help="Workflow name override")
+    ap.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Force offline parser (no Gemini call)",
+    )
+    ap.add_argument(
+        "--learn",
+        action="store_true",
+        help="Enable ChatHTN online method learning on gaps",
+    )
+    ap.add_argument(
+        "--feedback",
+        action="store_true",
+        help="Record execution outcome (uses --tools and --outcome)",
+    )
+    ap.add_argument("--tools", help="Comma-separated tool names for --feedback")
+    ap.add_argument(
+        "--outcome", choices=["success", "failure"], help="Outcome for --feedback"
+    )
     ap.add_argument("--list-tasks", action="store_true")
     args = ap.parse_args()
 
@@ -87,6 +142,12 @@ def main():
             print(f"  {t}")
         return
 
+    if args.feedback:
+        if not args.tools or not args.outcome:
+            ap.error("--feedback requires --tools and --outcome")
+        _cmd_feedback(args, reasoner)
+        return
+
     if args.task:
         _cmd_task(args, reasoner)
         return
@@ -95,7 +156,7 @@ def main():
         _cmd_query(args, reasoner)
         return
 
-    ap.error("Provide a query, --task, or --list-tasks")
+    ap.error("Provide a query, --task, --feedback, or --list-tasks")
 
 
 if __name__ == "__main__":
