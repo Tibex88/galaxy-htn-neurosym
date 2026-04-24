@@ -21,3 +21,6 @@ build/
 
 # External repos (has its own git)
 PeTTa/
+
+# Generated workflow artifacts (per-run timestamped dirs)
+generated/

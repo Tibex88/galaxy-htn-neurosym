@@ -15,6 +15,9 @@ Usage:
 """
 
 import argparse
+import re
+import time
+from pathlib import Path
 
 from src.pln.reasoner import PLNReasoner
 from src.htn.planner import HTNPlanner
@@ -22,6 +25,17 @@ from src.parsing.parser import QueryParser
 from src.galaxy.compiler import WorkflowCompiler
 from src.htn.online_learner import OnlineLearner
 from src.htn.feedback import FeedbackLearner
+
+
+GENERATED_ROOT = Path(__file__).parent / "generated"
+
+
+def _default_output_path(workflow_name: str) -> Path:
+    """generated/<unix_timestamp>/<workflow_name>.gxwf.yml"""
+    ts_dir = GENERATED_ROOT / str(int(time.time()))
+    ts_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", workflow_name) or "workflow"
+    return ts_dir / f"{safe_name}.gxwf.yml"
 
 
 def _cmd_task(args, reasoner):
@@ -83,14 +97,9 @@ def _cmd_query(args, reasoner):
             f"toolshed IDs: {compiled.missing_full_ids[:3]}..."
         )
 
-    if args.out:
-        path = compiled.write(args.out)
-        print(f"  wrote gxformat2 YAML -> {path}")
-    else:
-        print("\n--- gxformat2 YAML (truncated) ---")
-        print(compiled.yaml[:1500])
-        if len(compiled.yaml) > 1500:
-            print("...")
+    out_path = Path(args.out) if args.out else _default_output_path(compiled.name)
+    path = compiled.write(out_path)
+    print(f"  wrote gxformat2 YAML -> {path}")
 
 
 def _cmd_feedback(args, reasoner):
