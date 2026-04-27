@@ -10,6 +10,7 @@ PLN truth-value formulas (Expectation, Revision, Modus Ponens) run in
 Python. Hyperon is used purely as the KB query backend.
 """
 
+import json
 import math
 import re
 import sys
@@ -59,6 +60,11 @@ class PLNReasoner:
         self.metta = MeTTa()
         self._loaded = False
         self._stv_cache: dict[str, tuple[float, float]] = {}
+        # Sidecar metadata keyed by safe_name. Holds display_name / full_id /
+        # owner so the compiler can resolve gxformat2 tool_id values without
+        # putting quoted strings into the MeTTa atomspace (hyperon 0.2.10's
+        # trie index panics on large quoted-string spaces).
+        self._tool_meta: dict[str, dict[str, str]] = {}
 
     def load(self) -> "PLNReasoner":
         if self._loaded:
@@ -79,6 +85,14 @@ class PLNReasoner:
         if missing:
             print(f"\n  Missing domain files: {missing}")
             print("  Run:  python scripts/generate_metta.py\n")
+
+        meta_path = DOMAIN_DIR / "tool_meta.json"
+        if meta_path.exists():
+            try:
+                self._tool_meta = json.loads(meta_path.read_text())
+                print(f"  Loaded tool_meta.json ({len(self._tool_meta)} entries)")
+            except Exception as e:
+                print(f"  Warning: tool_meta.json parse failed: {e}")
 
         self._loaded = True
         return self
@@ -102,10 +116,27 @@ class PLNReasoner:
         return UNINFORMED_PRIOR
 
     def get_tool_full_id(self, safe_name: str) -> str | None:
-        atoms = self._q(f"!(match &self (ToolFullID {safe_name} $fid) $fid)")
-        if atoms:
-            return str(atoms[0]).strip().strip('"') or None
-        return None
+        meta = self._tool_meta.get(safe_name) or {}
+        full_id = meta.get("full_id")
+        return full_id or None
+
+    def get_tool_display_name(self, safe_name: str) -> str | None:
+        """Original tool display name (with spaces / dashes preserved)."""
+        meta = self._tool_meta.get(safe_name) or {}
+        return meta.get("display_name") or None
+
+    def resolve_tool_id(self, safe_name: str) -> str:
+        """
+        Galaxy-facing tool ID resolution.
+        Preference order: full_id (toolshed) -> display_name -> safe_name.
+        """
+        full_id = self.get_tool_full_id(safe_name)
+        if full_id:
+            return full_id
+        display = self.get_tool_display_name(safe_name)
+        if display:
+            return display
+        return safe_name
 
     def get_methods_for_task(self, task_type: str) -> list[str]:
         atoms = self._q(

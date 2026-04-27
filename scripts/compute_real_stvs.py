@@ -5,11 +5,12 @@ Replaces the mock (STV 0.70 0.30) seed values in tool_atoms.metta with
 evidence-based priors computed from how many of the 687 curated workflows
 each tool appears in.
 
-Strength  = usage_rank_percentile   — higher rank = better historical signal
-Confidence = min(1.0, log(1 + usage_count) / log(1 + max_usage))  — evidence saturates
+Strength   = usage_rank_percentile   — higher rank = better historical signal
+Confidence = min(1.0, log(1 + usage_count) / log(1 + max_usage))  — saturates
 
 Run after `scripts/generate_metta.py` to overlay real values onto the
-auto-generated tool_atoms.metta.
+auto-generated tool_atoms.metta. ToolDisplayName / ToolFullID atoms are
+emitted by generate_metta.py at extraction time and are not touched here.
 """
 
 import math
@@ -101,7 +102,11 @@ def compute_stvs(frequencies: dict[str, int]) -> dict[str, tuple[float, float]]:
 
 
 def rewrite_tool_atoms(stvs: dict[str, tuple[float, float]], full_ids: dict[str, str]):
-    """Replace mock STVs in tool_atoms.metta and append ToolFullID atoms."""
+    """
+    Replace mock STVs in tool_atoms.metta. ToolFullID atoms are only
+    appended if generate_metta.py did not already emit them (legacy
+    tool_atoms files without the new emitter).
+    """
     text = TOOL_ATOMS_PATH.read_text()
     updated = 0
 
@@ -120,16 +125,16 @@ def rewrite_tool_atoms(stvs: dict[str, tuple[float, float]], full_ids: dict[str,
         text,
     )
 
-    full_id_lines = ["", "; --- ToolFullID atoms (name -> toolshed ID) ---"]
     added = 0
-    for name, full_id in full_ids.items():
-        safe = _safe_name(name)
-        if safe in stvs and full_id:
-            full_id_lines.append(f'(ToolFullID {safe} "{full_id}")')
-            added += 1
-
-    if f"; --- ToolFullID atoms" not in text:
-        text += "\n" + "\n".join(full_id_lines) + "\n"
+    if "(ToolFullID " not in text:
+        full_id_lines = ["", "; --- ToolFullID atoms (name -> toolshed ID) ---"]
+        for name, full_id in full_ids.items():
+            safe = _safe_name(name)
+            if safe in stvs and full_id:
+                full_id_lines.append(f'(ToolFullID {safe} "{full_id}")')
+                added += 1
+        if added:
+            text += "\n" + "\n".join(full_id_lines) + "\n"
 
     TOOL_ATOMS_PATH.write_text(text)
     return updated, added

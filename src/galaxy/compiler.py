@@ -67,9 +67,9 @@ class WorkflowCompiler:
 
         lines: list[str] = []
         lines.append("class: GalaxyWorkflow")
-        lines.append(f"name: {_y_str(workflow_name)}")
+        lines.append(f"label: {_y_str(workflow_name)}")
         if annotation:
-            lines.append(f"annotation: {_y_str(annotation)}")
+            lines.append(f"doc: {_y_str(annotation)}")
         lines.append("")
 
         # Collect unique data inputs from the first step of the first plan.
@@ -79,11 +79,20 @@ class WorkflowCompiler:
         lines.append('    doc: "Primary input dataset (e.g. FASTQ / BAM)."')
         lines.append("")
 
+        # gxformat2 v19_09 requires an outputs block (may be empty).
+        lines.append("outputs: {}")
+        lines.append("")
+
         lines.append("steps:")
 
-        step_counter = 0
         prev_step_id: str | None = "input_dataset"
         prev_is_input = True
+
+        # Tracks how many times each tool name has been used so we can
+        # disambiguate duplicates (gxformat2 step keys must be unique).
+        # Galaxy renders the step key as the step label in its UI, so we
+        # keep keys as the bare tool name where possible.
+        used_keys: dict[str, int] = {}
 
         for plan in plans:
             if not plan.ok:
@@ -94,21 +103,27 @@ class WorkflowCompiler:
             tool_to_step_id: dict[str, str] = {}
 
             for i, tool in enumerate(plan.tools):
-                step_counter += 1
-                step_id = f"step_{step_counter}_{tool}"[:100]
+                base = tool
+                count = used_keys.get(base, 0) + 1
+                used_keys[base] = count
+                step_id = base if count == 1 else f"{base}_{count}"
                 tool_to_step_id[tool] = step_id
 
-                full_id = self.reasoner.get_tool_full_id(tool)
-                if full_id is None:
+                # Prefer ToolFullID (toolshed) -> ToolDisplayName (original
+                # un-sanitized name) -> safe_name as a last resort. The
+                # safe_name is junk to Galaxy's tool registry — record it
+                # so callers know which tools still need a real ID source.
+                tool_ref = self.reasoner.resolve_tool_id(tool)
+                if tool_ref == tool and self.reasoner.get_tool_full_id(tool) is None:
                     missing_full_ids.append(tool)
-                    tool_ref = tool
-                else:
-                    tool_ref = full_id
                 all_tool_ids.append(tool_ref)
 
+                # In gxformat2, the step's dict key serves as its label and is
+                # what `in: source:` references must point to. Setting an
+                # explicit `label:` here would override the dict key and break
+                # source resolution in gxwf-to-native.
                 lines.append(f"  {step_id}:")
                 lines.append(f"    tool_id: {_y_str(tool_ref)}")
-                lines.append(f"    label: {_y_str(tool)}")
 
                 connections = self._resolve_connections(
                     tool=tool,

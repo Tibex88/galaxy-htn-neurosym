@@ -31,16 +31,33 @@ class MeTTaGenerator:
         )
 
     def generate_tool_atoms(self, operators: list) -> str:
+        """
+        Emit tool_atoms.metta plus a sidecar tool_meta.json mapping
+        safe_name -> {display_name, full_id, owner}.
+
+        The display_name and full_id are kept OUT of MeTTa because
+        hyperon 0.2.10's trie index panics on large numbers of quoted
+        string atoms. The sidecar JSON is read by PLNReasoner on load
+        for tool_id resolution at compile time.
+        """
+        import json
+
         lines = [
             "; ============================================",
             "; Tool atoms with initial TruthValues",
             "; Auto-generated from Neo4j Knowledge Graph",
+            ";",
+            "; Sidecar tool_meta.json (next to this file) holds the",
+            "; un-sanitized display names and toolshed full IDs that the",
+            "; compiler uses as gxformat2 tool_id values. They live in JSON",
+            "; rather than MeTTa to avoid hyperon 0.2.10 trie panics on",
+            "; large quoted-string atomspaces.",
             "; ============================================",
             "",
         ]
 
-        # Count how many workflows each tool appears in
-        seen_names = set()
+        seen_names: set[str] = set()
+        meta: dict[str, dict[str, str]] = {}
 
         for op in operators:
             safe = self._safe_name(op.name)
@@ -51,8 +68,6 @@ class MeTTaGenerator:
             has_outputs = (
                 len(op.data_outputs) > 0 if hasattr(op, "data_outputs") else True
             )
-            # use mock stv
-            # TODO: find a good way to calculate this stv values
             strength = 0.7 if has_outputs else 0.5
             confidence = 0.3
 
@@ -60,11 +75,28 @@ class MeTTaGenerator:
                 f"(= (tool-quality {safe}) (STV {strength:.2f} {confidence:.2f}))"
             )
 
+            entry = {}
+            display_name = (op.name or "").strip()
+            if display_name and display_name != safe:
+                entry["display_name"] = display_name
+            full_id = (getattr(op, "full_id", "") or "").strip()
+            if full_id:
+                entry["full_id"] = full_id
+            owner = (getattr(op, "owner", "") or "").strip()
+            if owner:
+                entry["owner"] = owner
+            if entry:
+                meta[safe] = entry
+
         lines.append("")
         lines.append(f"; Total tools: {len(seen_names)}")
 
         content = "\n".join(lines)
         self._write_file("tool_atoms.metta", content)
+
+        meta_path = self.output_dir / "tool_meta.json"
+        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
+        print(f"  Written: {meta_path} ({len(meta)} entries)")
         return content
 
     def generate_method_sets(self, method_sets: list) -> str:

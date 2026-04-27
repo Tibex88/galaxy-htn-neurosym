@@ -1,6 +1,12 @@
 ; ============================================
 ; Tool atoms with initial TruthValues
 ; Auto-generated from Neo4j Knowledge Graph
+;
+; Sidecar tool_meta.json (next to this file) holds the
+; un-sanitized display names and toolshed full IDs that the
+; compiler uses as gxformat2 tool_id values. They live in JSON
+; rather than MeTTa to avoid hyperon 0.2.10 trie panics on
+; large quoted-string atomspaces.
 ; ============================================
 
 (= (tool-quality Faster_Download_and_Extract_Reads_in_FASTQ) (STV 0.70 0.30))
