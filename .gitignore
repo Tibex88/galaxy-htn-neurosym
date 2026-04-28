@@ -24,3 +24,6 @@ PeTTa/
 
 # Generated workflow artifacts (per-run timestamped dirs)
 generated/
+
+# macOS finder metadata
+.DS_Store
