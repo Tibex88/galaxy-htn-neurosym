@@ -91,10 +91,20 @@ def _cmd_query(args, reasoner):
     )
     print("\n[3/3] COMPILED")
     print(f"  {len(compiled.tool_ids)} tool steps")
+    if compiled.workflow_inputs:
+        print(
+            f"  {len(compiled.workflow_inputs)} workflow inputs: "
+            f"{compiled.workflow_inputs}"
+        )
     if compiled.missing_full_ids:
         print(
             f"  warning: {len(compiled.missing_full_ids)} tools missing "
             f"toolshed IDs: {compiled.missing_full_ids[:3]}..."
+        )
+    if compiled.unconnected_step_inputs:
+        print(
+            f"  warning: {len(compiled.unconnected_step_inputs)} step inputs "
+            f"unconnected: {compiled.unconnected_step_inputs[:3]}..."
         )
 
     out_path = Path(args.out) if args.out else _default_output_path(compiled.name)

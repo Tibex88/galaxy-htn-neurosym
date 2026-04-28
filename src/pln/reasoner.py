@@ -65,6 +65,9 @@ class PLNReasoner:
         # putting quoted strings into the MeTTa atomspace (hyperon 0.2.10's
         # trie index panics on large quoted-string spaces).
         self._tool_meta: dict[str, dict[str, str]] = {}
+        # Sidecar per-method step data (steps + method_inputs), keyed by
+        # method_name. Lives in JSON for the same trie-panic reason.
+        self._method_meta: dict[str, dict] = {}
 
     def load(self) -> "PLNReasoner":
         if self._loaded:
@@ -93,6 +96,21 @@ class PLNReasoner:
                 print(f"  Loaded tool_meta.json ({len(self._tool_meta)} entries)")
             except Exception as e:
                 print(f"  Warning: tool_meta.json parse failed: {e}")
+
+        method_meta_path = DOMAIN_DIR / "method_meta.json"
+        if method_meta_path.exists():
+            try:
+                self._method_meta = json.loads(method_meta_path.read_text())
+                step_count = sum(
+                    len(m.get("steps", []))
+                    for m in self._method_meta.values()
+                )
+                print(
+                    f"  Loaded method_meta.json "
+                    f"({len(self._method_meta)} methods, {step_count} steps)"
+                )
+            except Exception as e:
+                print(f"  Warning: method_meta.json parse failed: {e}")
 
         self._loaded = True
         return self
@@ -178,6 +196,55 @@ class PLNReasoner:
                     }
                 )
         return flows
+
+    # ------------------------------------------------------------------ #
+    # Step-keyed lookups (preferred for compilation — disambiguate duplicate
+    # tool instances within the same method).
+    # ------------------------------------------------------------------ #
+
+    def get_method_steps(self, method_name: str) -> list[dict]:
+        """
+        Returns ordered list of {step_id, tool, position} for a method.
+        Sourced from method_meta.json (loaded at PLNReasoner.load).
+        """
+        meta = self._method_meta.get(method_name)
+        if not meta:
+            return []
+        return [
+            {
+                "step_id": s["step_id"],
+                "tool": s["tool"],
+                "position": s["position"],
+            }
+            for s in sorted(meta.get("steps", []), key=lambda s: s["position"])
+        ]
+
+    def get_step_dataflow(self, method_name: str, step_id: str) -> list[dict]:
+        """Per-step input/output flow records: {direction, port, var}."""
+        meta = self._method_meta.get(method_name)
+        if not meta:
+            return []
+        for s in meta.get("steps", []):
+            if s["step_id"] != step_id:
+                continue
+            flows = []
+            for inp in s.get("inputs", []):
+                flows.append(
+                    {"direction": "input", "port": inp["port"], "var": inp["var"]}
+                )
+            for out in s.get("outputs", []):
+                flows.append(
+                    {"direction": "output", "port": out["port"], "var": out["var"]}
+                )
+            return flows
+        return []
+
+    def get_method_inputs(self, method_name: str) -> list[dict]:
+        """Vars that must come from outside the method (workflow inputs)."""
+        meta = self._method_meta.get(method_name)
+        if not meta:
+            return []
+        return list(meta.get("method_inputs", []))
 
     def get_type_parent(self, type_name: str) -> list[str]:
         atoms = self._q(

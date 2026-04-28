@@ -6,10 +6,14 @@ recovered from the KB) and emits a gxformat2 YAML document suitable
 for import into a Galaxy server via BioBlend.
 
 Data-flow reconstruction preserves DAG topology — parallel branches
-and fan-in joins survive compilation. A linear method sequence
-degrades to a linear YAML chain; a method with real fork/join
-structure (recoverable from MethodDataFlow atoms) is serialized with
-multiple input_connections per step.
+and fan-in joins survive compilation. The compiler walks each method's
+step-keyed atoms (MethodStep / StepDataFlow / MethodInput) so that
+multiple instances of the same tool (e.g. 3x MultiQC) get distinct
+input wiring instead of being collapsed.
+
+Workflow-level inputs are emitted for each variable that no step in
+the plan produces — these become the user-supplied datasets when the
+workflow is run on a Galaxy server.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ class CompiledWorkflow:
     yaml: str
     tool_ids: list[str] = field(default_factory=list)
     missing_full_ids: list[str] = field(default_factory=list)
+    workflow_inputs: list[str] = field(default_factory=list)
+    unconnected_step_inputs: list[tuple[str, str]] = field(default_factory=list)
 
     def write(self, path: str | Path) -> Path:
         p = Path(path)
@@ -37,13 +43,40 @@ class CompiledWorkflow:
 
 
 def _y_str(s: str) -> str:
-    """Escape a string as a YAML scalar."""
     if not s:
         return '""'
     if any(ch in s for ch in ":#@`\n\"'"):
         escaped = s.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return s
+
+
+def _y_key(s: str) -> str:
+    if not s:
+        return '""'
+    if s[0].isdigit() or any(ch in s for ch in ' :#@`,[]{}|>?*&!%"\''):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
+def _y_source(s: str) -> str:
+    if not s:
+        return '""'
+    if any(ch in s for ch in ' :#@`,[]{}|>?*&!%"\''):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
+def _input_label(port: str) -> str:
+    """
+    Synthesize a friendly label for a workflow input derived from a tool
+    port name. Strip Galaxy's `cond|sub|leaf` pipe nesting and use the
+    leaf segment.
+    """
+    leaf = port.rsplit("|", 1)[-1] if "|" in port else port
+    return leaf or "input"
 
 
 class WorkflowCompiler:
@@ -56,15 +89,40 @@ class WorkflowCompiler:
         workflow_name: str = "htn_generated_workflow",
         annotation: str = "",
     ) -> CompiledWorkflow:
-        """
-        Compile one or more plans into a single gxformat2 YAML workflow.
-        Sequential plans are chained: the last tool of plan N feeds the
-        first tool of plan N+1 when types are compatible (best-effort;
-        verification happens in the planner).
-        """
         all_tool_ids: list[str] = []
         missing_full_ids: list[str] = []
+        unconnected_inputs: list[tuple[str, str]] = []
 
+        # Used to disambiguate workflow input names if multiple tools
+        # need a port called e.g. `input`.
+        input_name_used: dict[str, int] = defaultdict(int)
+        # Map var -> workflow_input_name. A given var may be required by
+        # multiple steps; they all reference the same workflow input.
+        var_to_input_name: dict[str, str] = {}
+        # Ordered list of (input_name, port_kind) for the inputs: block
+        workflow_inputs: list[tuple[str, str]] = []
+
+        # First pass — collect workflow-level inputs across all plans.
+        # We build them up front so we can emit the inputs: block before
+        # the steps: block (gxformat2 expects this order).
+        plan_to_method_inputs: dict[int, list[dict]] = {}
+        for plan_idx, plan in enumerate(plans):
+            if not plan.ok:
+                continue
+            method_inputs = self.reasoner.get_method_inputs(plan.method_name)
+            plan_to_method_inputs[plan_idx] = method_inputs
+            for mi in method_inputs:
+                var = mi["var"]
+                if var in var_to_input_name:
+                    continue
+                base = _input_label(mi["port"])
+                input_name_used[base] += 1
+                count = input_name_used[base]
+                input_name = base if count == 1 else f"{base}_{count}"
+                var_to_input_name[var] = input_name
+                workflow_inputs.append((input_name, "data"))
+
+        # Header
         lines: list[str] = []
         lines.append("class: GalaxyWorkflow")
         lines.append(f"label: {_y_str(workflow_name)}")
@@ -72,78 +130,90 @@ class WorkflowCompiler:
             lines.append(f"doc: {_y_str(annotation)}")
         lines.append("")
 
-        # Collect unique data inputs from the first step of the first plan.
+        # Workflow-level inputs. Always emit at least one fallback input so
+        # the workflow remains importable even when the KB has no
+        # MethodInput atoms for the chosen plans.
         lines.append("inputs:")
-        lines.append("  input_dataset:")
-        lines.append("    type: data")
-        lines.append('    doc: "Primary input dataset (e.g. FASTQ / BAM)."')
+        if workflow_inputs:
+            for input_name, kind in workflow_inputs:
+                lines.append(f"  {_y_key(input_name)}:")
+                lines.append(f"    type: {kind}")
+        else:
+            lines.append("  input_dataset:")
+            lines.append("    type: data")
+            lines.append('    doc: "Primary input dataset (e.g. FASTQ / BAM)."')
         lines.append("")
 
-        # gxformat2 v19_09 requires an outputs block (may be empty).
         lines.append("outputs: {}")
         lines.append("")
 
         lines.append("steps:")
 
-        prev_step_id: str | None = "input_dataset"
-        prev_is_input = True
-
-        # Tracks how many times each tool name has been used so we can
-        # disambiguate duplicates (gxformat2 step keys must be unique).
-        # Galaxy renders the step key as the step label in its UI, so we
-        # keep keys as the bare tool name where possible.
         used_keys: dict[str, int] = {}
+        # step_id (KB) -> YAML step label, populated as we emit each step.
+        step_id_to_label: dict[str, str] = {}
 
-        for plan in plans:
+        for plan_idx, plan in enumerate(plans):
             if not plan.ok:
                 continue
-            dataflow = self.reasoner.get_method_dataflow(plan.method_name)
-            per_tool_flows = self._index_by_tool(dataflow)
 
-            tool_to_step_id: dict[str, str] = {}
+            steps = self.reasoner.get_method_steps(plan.method_name)
+            if not steps:
+                # KB has no MethodStep atoms (legacy method or empty plan);
+                # skip — without per-step info we cannot wire inputs safely.
+                continue
 
-            for i, tool in enumerate(plan.tools):
-                base = tool
-                count = used_keys.get(base, 0) + 1
-                used_keys[base] = count
-                step_id = base if count == 1 else f"{base}_{count}"
-                tool_to_step_id[tool] = step_id
+            # Build var -> (kb_step_id, output_port) for this method.
+            var_producer: dict[str, tuple[str, str]] = {}
+            step_inputs: dict[str, list[dict]] = {}
+            for step in steps:
+                flows = self.reasoner.get_step_dataflow(plan.method_name, step["step_id"])
+                for f in flows:
+                    if f["direction"] == "output":
+                        var_producer[f["var"]] = (step["step_id"], f["port"])
+                    elif f["direction"] == "input":
+                        step_inputs.setdefault(step["step_id"], []).append(f)
 
-                # Prefer ToolFullID (toolshed) -> ToolDisplayName (original
-                # un-sanitized name) -> safe_name as a last resort. The
-                # safe_name is junk to Galaxy's tool registry — record it
-                # so callers know which tools still need a real ID source.
+            for step in steps:
+                tool = step["tool"]
+                kb_step_id = step["step_id"]
+
                 tool_ref = self.reasoner.resolve_tool_id(tool)
                 if tool_ref == tool and self.reasoner.get_tool_full_id(tool) is None:
                     missing_full_ids.append(tool)
                 all_tool_ids.append(tool_ref)
 
-                # In gxformat2, the step's dict key serves as its label and is
-                # what `in: source:` references must point to. Setting an
-                # explicit `label:` here would override the dict key and break
-                # source resolution in gxwf-to-native.
-                lines.append(f"  {step_id}:")
+                display_name = self.reasoner.get_tool_display_name(tool) or tool
+                count = used_keys.get(display_name, 0) + 1
+                used_keys[display_name] = count
+                yaml_label = display_name if count == 1 else f"{display_name} ({count})"
+                step_id_to_label[kb_step_id] = yaml_label
+
+                lines.append(f"  {_y_key(yaml_label)}:")
                 lines.append(f"    tool_id: {_y_str(tool_ref)}")
 
-                connections = self._resolve_connections(
-                    tool=tool,
-                    tool_index=i,
-                    plan=plan,
-                    per_tool_flows=per_tool_flows,
-                    tool_to_step_id=tool_to_step_id,
-                    prev_step_id=prev_step_id,
-                    prev_is_input=prev_is_input,
-                )
+                connections: list[tuple[str, str]] = []
+                for in_flow in step_inputs.get(kb_step_id, []):
+                    port = in_flow["port"]
+                    var = in_flow["var"]
+                    prod = var_producer.get(var)
+                    if prod and prod[0] in step_id_to_label:
+                        upstream_label = step_id_to_label[prod[0]]
+                        connections.append((port, f"{upstream_label}/{prod[1]}"))
+                    elif var in var_to_input_name:
+                        connections.append((port, var_to_input_name[var]))
+                    else:
+                        # Producer hasn't been emitted yet (shouldn't happen
+                        # in topo order) and var isn't a method input — leave
+                        # the port unconnected and surface it for the caller.
+                        unconnected_inputs.append((yaml_label, port))
 
                 if connections:
                     lines.append("    in:")
                     for port, source in connections:
-                        lines.append(f"      {port}:")
-                        lines.append(f"        source: {source}")
+                        lines.append(f"      {_y_key(port)}:")
+                        lines.append(f"        source: {_y_source(source)}")
                 lines.append("")
-
-                prev_step_id = step_id
-                prev_is_input = False
 
         yaml = "\n".join(lines)
         return CompiledWorkflow(
@@ -151,56 +221,6 @@ class WorkflowCompiler:
             yaml=yaml,
             tool_ids=all_tool_ids,
             missing_full_ids=sorted(set(missing_full_ids)),
+            workflow_inputs=[name for name, _ in workflow_inputs],
+            unconnected_step_inputs=unconnected_inputs,
         )
-
-    @staticmethod
-    def _index_by_tool(dataflow: list[dict]) -> dict[str, dict]:
-        """Group dataflow records by tool for O(1) per-tool lookup."""
-        idx: dict[str, dict] = defaultdict(lambda: {"inputs": [], "outputs": []})
-        for flow in dataflow:
-            idx[flow["tool"]][flow["direction"] + "s"].append(flow)
-        return idx
-
-    def _resolve_connections(
-        self,
-        tool: str,
-        tool_index: int,
-        plan: Plan,
-        per_tool_flows: dict[str, dict],
-        tool_to_step_id: dict[str, str],
-        prev_step_id: str | None,
-        prev_is_input: bool,
-    ) -> list[tuple[str, str]]:
-        """
-        Resolve each input port on the current tool to either a previous
-        step's output or the primary workflow input.
-        """
-        flows = per_tool_flows.get(tool, {"inputs": [], "outputs": []})
-        inputs = flows.get("inputs", [])
-
-        if not inputs:
-            if prev_step_id and tool_index > 0 and not prev_is_input:
-                return [("input", f"{prev_step_id}/output")]
-            if prev_step_id and prev_is_input:
-                return [("input", prev_step_id)]
-            return []
-
-        # Build reverse map: variable -> producing (tool, output_port)
-        var_producer: dict[str, tuple[str, str]] = {}
-        for upstream_tool, upstream_flows in per_tool_flows.items():
-            for out in upstream_flows.get("outputs", []):
-                var_producer[out["var"]] = (upstream_tool, out["port"])
-
-        connections: list[tuple[str, str]] = []
-        for in_flow in inputs:
-            port = in_flow["port"]
-            var = in_flow["var"]
-            prod = var_producer.get(var)
-            if prod and prod[0] in tool_to_step_id:
-                upstream_step = tool_to_step_id[prod[0]]
-                connections.append((port, f"{upstream_step}/{prod[1]}"))
-            elif prev_step_id and tool_index > 0 and not prev_is_input:
-                connections.append((port, f"{prev_step_id}/output"))
-            elif prev_step_id and prev_is_input:
-                connections.append((port, prev_step_id))
-        return connections

@@ -2,6 +2,16 @@
 ; HTN Method Sets: alternative workflows for each task type
 ; PLN selects the best method based on tool TruthValues
 ; Auto-generated from Neo4j Knowledge Graph
+;
+; MeTTa form (lean):
+;   (= (method-for TASK METHOD) (MethodSequence (t1 t2 ...)))
+;   (MethodUsesTool method tool)
+;   (MethodDataFlow method tool direction port var)  -- legacy
+;
+; Per-step disambiguated data lives in method_meta.json next
+; to this file. The compiler reads that JSON for connection
+; resolution because hyperon 0.2.10's trie panics on large
+; atomspaces.
 ; ============================================
 
 ; ---- Task: 'Biomarkers4Paris' Workflow (1 alternatives) ----

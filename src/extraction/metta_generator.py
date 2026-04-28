@@ -100,11 +100,55 @@ class MeTTaGenerator:
         return content
 
     def generate_method_sets(self, method_sets: list) -> str:
+        """
+        Emits per-method MeTTa atoms (planner uses these) plus a sidecar
+        method_meta.json (compiler uses this) with per-step disambiguated
+        data flow.
+
+        MeTTa form (lean — kept inside hyperon's safe atom-volume window):
+          (= (method-for TASK METHOD) (MethodSequence (t1 t2 ...)))
+          (MethodUsesTool METHOD tool)
+          (MethodDataFlow METHOD tool direction port var)  -- legacy
+
+        Sidecar method_meta.json keyed by method_name:
+          {
+            "<method>": {
+              "task_type": "...",
+              "steps": [
+                {"step_id": "...", "tool": "...", "position": 0,
+                 "inputs":  [{"port": "...", "var": "?data_N"}, ...],
+                 "outputs": [{"port": "...", "var": "?data_N"}, ...]},
+                ...
+              ],
+              "method_inputs": [
+                {"var": "?data_N", "step_id": "...", "port": "..."}, ...
+              ]
+            }
+          }
+
+        Per-step data lives outside MeTTa because hyperon 0.2.10's trie
+        index panics once the atomspace grows past a few thousand atoms
+        (same failure mode as the ToolDisplayName/ToolFullID attempt).
+        """
+        import json
+
+        method_meta: dict[str, dict] = {}
+
         lines = [
             "; ============================================",
             "; HTN Method Sets: alternative workflows for each task type",
             "; PLN selects the best method based on tool TruthValues",
             "; Auto-generated from Neo4j Knowledge Graph",
+            ";",
+            "; MeTTa form (lean):",
+            ";   (= (method-for TASK METHOD) (MethodSequence (t1 t2 ...)))",
+            ";   (MethodUsesTool method tool)",
+            ";   (MethodDataFlow method tool direction port var)  -- legacy",
+            ";",
+            "; Per-step disambiguated data lives in method_meta.json next",
+            "; to this file. The compiler reads that JSON for connection",
+            "; resolution because hyperon 0.2.10's trie panics on large",
+            "; atomspaces.",
             "; ============================================",
             "",
         ]
@@ -129,7 +173,6 @@ class MeTTaGenerator:
                     continue
 
                 tool_list = " ".join(tool_names)
-                # Method declaration: this method achieves this task type
                 lines.append(f"(= (method-for {task_safe} {method_name})")
                 lines.append(f"   (MethodSequence ({tool_list})))")
                 lines.append("")
@@ -137,6 +180,7 @@ class MeTTaGenerator:
                 for tool_safe in tool_names:
                     lines.append(f"(MethodUsesTool {method_name} {tool_safe})")
 
+                # ----- Legacy tool-keyed dataflow (kept for backwards compat) -----
                 for subtask in method.subtasks:
                     tool_safe = (
                         self._safe_name(subtask.tool_name)
@@ -156,11 +200,74 @@ class MeTTaGenerator:
                         lines.append(
                             f"(MethodDataFlow {method_name} {tool_safe} output {port_safe} {var_name})"
                         )
+
+                # ----- Sidecar JSON — per-step disambiguated data -----
+                produced_vars: set[str] = set()
+                json_steps: list[dict] = []
+                for position, subtask in enumerate(method.subtasks):
+                    if not subtask.tool_name:
+                        continue
+                    tool_safe = self._safe_name(subtask.tool_name)
+                    step_safe = (
+                        self._safe_name(subtask.step_uid) or f"step_{position}"
+                    )
+                    inputs_list = [
+                        {"port": port, "var": var}
+                        for port, var in subtask.inputs.items()
+                    ]
+                    outputs_list = [
+                        {"port": port, "var": var}
+                        for port, var in subtask.outputs.items()
+                    ]
+                    for o in outputs_list:
+                        produced_vars.add(o["var"])
+                    json_steps.append(
+                        {
+                            "step_id": step_safe,
+                            "tool": tool_safe,
+                            "position": position,
+                            "inputs": inputs_list,
+                            "outputs": outputs_list,
+                        }
+                    )
+
+                method_inputs_list: list[dict] = []
+                seen_input_vars: set[str] = set()
+                for s in json_steps:
+                    for inp in s["inputs"]:
+                        if (
+                            inp["var"] not in produced_vars
+                            and inp["var"] not in seen_input_vars
+                        ):
+                            method_inputs_list.append(
+                                {
+                                    "var": inp["var"],
+                                    "step_id": s["step_id"],
+                                    "port": inp["port"],
+                                }
+                            )
+                            seen_input_vars.add(inp["var"])
+
+                method_meta[method_name] = {
+                    "task_type": ms.task_type,
+                    "task_safe": task_safe,
+                    "steps": json_steps,
+                    "method_inputs": method_inputs_list,
+                }
+
                 lines.append("")
             lines.append("")
 
         content = "\n".join(lines)
         self._write_file("method_sets.metta", content)
+
+        meta_path = self.output_dir / "method_meta.json"
+        meta_path.write_text(json.dumps(method_meta, indent=2, sort_keys=True))
+        print(
+            f"  Written: {meta_path} "
+            f"({len(method_meta)} methods, "
+            f"{sum(len(m['steps']) for m in method_meta.values())} steps)"
+        )
         return content
 
     def generate_type_hierarchy(self) -> str:
