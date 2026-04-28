@@ -27,12 +27,17 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 PORT_RULES: dict[str, dict[str, Any]] = {
-    # fastp
+    # fastp — paired_input is the SINGLE paired-collection input, not two
+    # separate R1/R2 datasets. Galaxy's selector for that mode is
+    # 'paired_collection', NOT 'paired' (which is for two distinct files).
     "single_paired|paired_input": {
-        "single_paired": {"single_paired_selector": "paired"}
+        "single_paired": {"single_paired_selector": "paired_collection"}
     },
     "single_paired|in1": {
-        "single_paired": {"single_paired_selector": "paired_collection"}
+        "single_paired": {"single_paired_selector": "single"}
+    },
+    "single_paired|in2": {
+        "single_paired": {"single_paired_selector": "paired"}
     },
     "single_paired|fastq_in1": {
         "single_paired": {"single_paired_selector": "single"}
@@ -55,8 +60,12 @@ PORT_RULES: dict[str, dict[str, Any]] = {
         "fastq_input": {"fastq_input_selector": "paired_collection"}
     },
 
-    # SnpEff family
-    "snpDb|snpeff_db": {"snpDb": {"snpeff_db_source": "custom"}},
+    # SnpEff eff — the discriminator field is `genomeSrc` (verified against
+    # tools-iuc/tool_collections/snpeff/snpEff.xml). Value `custom` selects
+    # "Custom snpEff database in your history", which is what we have when
+    # the snpDb is produced by an in-workflow SnpEff_build step.
+    "snpDb|snpeff_db": {"snpDb": {"genomeSrc": "custom"}},
+    # SnpEff build — selector for the reference genome source.
     "input_type|input_gbk": {"input_type": {"input_type_selector": "gbk"}},
 
     # Picard / SAMtools selectors
@@ -73,41 +82,49 @@ PORT_RULES: dict[str, dict[str, Any]] = {
 # MultiQC software_cond — discriminator depends on upstream producer
 # ---------------------------------------------------------------------------
 
-# upstream tool (safe_name) -> MultiQC software discriminator value
-MULTIQC_SOFTWARE_BY_UPSTREAM: dict[str, str] = {
-    "fastp": "fastp",
-    "FastQC": "fastqc",
-    "Samtools_stats": "samtools",
-    "Samtools_flagstat": "samtools",
-    "Samtools_idxstats": "samtools",
-    "MarkDuplicates": "picard",
-    "Picard_MarkDuplicates": "picard",
-    "Picard_CollectInsertSizeMetrics": "picard",
-    "Bowtie2": "bowtie2",
-    "HISAT2": "hisat2",
-    "STAR": "star",
-    "salmon": "salmon",
-    "Salmon_quant": "salmon",
-    "kallisto_quant": "kallisto",
-    "RSeQC_bam_stat": "rseqc",
-    "trimmomatic": "trimmomatic",
-    "Trim_Galore": "cutadapt",
-    "Cutadapt": "cutadapt",
-    "SnpEff_eff_": "snpeff",
-    "SnpEff_eff": "snpeff",
-    "featureCounts": "featurecounts",
-    "Tophat2": "tophat",
+# upstream tool (safe_name) -> (software_value, output_type_value | None)
+# software_value: discriminator for software_cond.software
+# output_type_value: discriminator for software_cond.output[0].type.type when
+#   the software branch has a nested type conditional. None means the branch
+#   has only a flat input port (no deeper conditional).
+MULTIQC_BY_UPSTREAM: dict[str, tuple[str, str | None]] = {
+    # fastp branch — single 'input' port, no nested type
+    "fastp": ("fastp", None),
+    "FastQC": ("fastqc", None),
+    # samtools branch — output[0].type.type selects stats|flagstat|idxstats
+    "Samtools_stats": ("samtools", "stats"),
+    "Samtools_flagstat": ("samtools", "flagstat"),
+    "Samtools_idxstats": ("samtools", "idxstats"),
+    # picard branch — output[0].type.type selects MarkDuplicates|InsertSize|...
+    "MarkDuplicates": ("picard", "markdups"),
+    "Picard_MarkDuplicates": ("picard", "markdups"),
+    "Picard_CollectInsertSizeMetrics": ("picard", "insertsize"),
+    # other tools — flat
+    "Bowtie2": ("bowtie2", None),
+    "HISAT2": ("hisat2", None),
+    "STAR": ("star", None),
+    "salmon": ("salmon", None),
+    "Salmon_quant": ("salmon", None),
+    "kallisto_quant": ("kallisto", None),
+    "RSeQC_bam_stat": ("rseqc", None),
+    "trimmomatic": ("trimmomatic", None),
+    "Trim_Galore": ("cutadapt", None),
+    "Cutadapt": ("cutadapt", None),
+    "SnpEff_eff_": ("snpeff", None),
+    "SnpEff_eff": ("snpeff", None),
+    "featureCounts": ("featurecounts", None),
+    "Tophat2": ("tophat", None),
 }
 
-DEFAULT_MULTIQC_SOFTWARE = "custom_content"
+DEFAULT_MULTIQC_SOFTWARE = ("custom_content", None)
 
 _RESULTS_INDEX_RE = re.compile(r"^results_(\d+)\b")
 
 
-def _multiqc_software_for(upstream_tool: str | None) -> str:
+def _multiqc_for(upstream_tool: str | None) -> tuple[str, str | None]:
     if not upstream_tool:
         return DEFAULT_MULTIQC_SOFTWARE
-    return MULTIQC_SOFTWARE_BY_UPSTREAM.get(upstream_tool, DEFAULT_MULTIQC_SOFTWARE)
+    return MULTIQC_BY_UPSTREAM.get(upstream_tool, DEFAULT_MULTIQC_SOFTWARE)
 
 
 def _deep_merge(dst: dict, src: dict) -> None:
@@ -151,13 +168,18 @@ def infer_state(
             idx = int(idx_match.group(1))
             prod = var_producer.get(flow["var"])
             upstream = prod[0] if prod else None
+            software, output_type = _multiqc_for(upstream)
+
             results = state.setdefault("results", [])
             while len(results) <= idx:
                 results.append({})
-            _deep_merge(
-                results[idx],
-                {"software_cond": {"software": _multiqc_software_for(upstream)}},
-            )
+            sw_cond = {"software": software}
+            # Software branches that wrap their data port inside a nested
+            # `output[0].type.type` conditional need that discriminator too,
+            # otherwise Galaxy renders the wrapping ports red.
+            if output_type:
+                sw_cond["output"] = [{"type": {"type": output_type}}]
+            _deep_merge(results[idx], {"software_cond": sw_cond})
 
     return state
 
