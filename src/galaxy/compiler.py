@@ -24,6 +24,7 @@ from pathlib import Path
 
 from src.htn.planner import Plan
 from src.pln.reasoner import PLNReasoner
+from src.galaxy.conditional_inference import infer_state, infer_input_type
 
 
 @dataclass
@@ -79,6 +80,23 @@ def _input_label(port: str) -> str:
     return leaf or "input"
 
 
+def _y_scalar(v) -> str:
+    """Render a Python scalar as YAML."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    if not s:
+        return '""'
+    if any(ch in s for ch in ":#@`\n\"'"):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
 class WorkflowCompiler:
     def __init__(self, reasoner: PLNReasoner):
         self.reasoner = reasoner
@@ -99,8 +117,9 @@ class WorkflowCompiler:
         # Map var -> workflow_input_name. A given var may be required by
         # multiple steps; they all reference the same workflow input.
         var_to_input_name: dict[str, str] = {}
-        # Ordered list of (input_name, port_kind) for the inputs: block
-        workflow_inputs: list[tuple[str, str]] = []
+        # Ordered list of (input_name, type_spec_dict). The type spec
+        # comes from infer_input_type() and may be "data" or a collection.
+        workflow_inputs: list[tuple[str, dict[str, str]]] = []
 
         # First pass — collect workflow-level inputs across all plans.
         # We build them up front so we can emit the inputs: block before
@@ -120,7 +139,7 @@ class WorkflowCompiler:
                 count = input_name_used[base]
                 input_name = base if count == 1 else f"{base}_{count}"
                 var_to_input_name[var] = input_name
-                workflow_inputs.append((input_name, "data"))
+                workflow_inputs.append((input_name, infer_input_type(mi["port"])))
 
         # Header
         lines: list[str] = []
@@ -135,9 +154,11 @@ class WorkflowCompiler:
         # MethodInput atoms for the chosen plans.
         lines.append("inputs:")
         if workflow_inputs:
-            for input_name, kind in workflow_inputs:
+            for input_name, type_spec in workflow_inputs:
                 lines.append(f"  {_y_key(input_name)}:")
-                lines.append(f"    type: {kind}")
+                for k in ("type", "collection_type"):
+                    if k in type_spec:
+                        lines.append(f"    {k}: {type_spec[k]}")
         else:
             lines.append("  input_dataset:")
             lines.append("    type: data")
@@ -192,8 +213,33 @@ class WorkflowCompiler:
                 lines.append(f"  {_y_key(yaml_label)}:")
                 lines.append(f"    tool_id: {_y_str(tool_ref)}")
 
+                # Build var_producer keyed by upstream TOOL (not step_id)
+                # so the conditional inference module — which only knows
+                # about tool names — can match upstream tools when picking
+                # MultiQC's software discriminator etc.
+                var_producer_by_tool: dict[str, tuple[str, str]] = {}
+                for upstream_step in steps:
+                    for f in self.reasoner.get_step_dataflow(
+                        plan.method_name, upstream_step["step_id"]
+                    ):
+                        if f["direction"] == "output":
+                            var_producer_by_tool[f["var"]] = (
+                                upstream_step["tool"],
+                                f["port"],
+                            )
+
+                this_step_inputs = step_inputs.get(kb_step_id, [])
+                state = infer_state(
+                    tool=tool,
+                    step_inputs=this_step_inputs,
+                    var_producer=var_producer_by_tool,
+                )
+                if state:
+                    lines.append("    state:")
+                    self._emit_state(lines, state, indent=6)
+
                 connections: list[tuple[str, str]] = []
-                for in_flow in step_inputs.get(kb_step_id, []):
+                for in_flow in this_step_inputs:
                     port = in_flow["port"]
                     var = in_flow["var"]
                     prod = var_producer.get(var)
@@ -224,3 +270,25 @@ class WorkflowCompiler:
             workflow_inputs=[name for name, _ in workflow_inputs],
             unconnected_step_inputs=unconnected_inputs,
         )
+
+    def _emit_state(self, lines: list[str], state, indent: int) -> None:
+        """
+        Recursively emit a nested state dict (with possible list values
+        for the MultiQC `results:` array) as gxformat2-compatible YAML.
+        """
+        pad = " " * indent
+        if isinstance(state, dict):
+            for k, v in state.items():
+                if isinstance(v, dict):
+                    lines.append(f"{pad}{_y_key(k)}:")
+                    self._emit_state(lines, v, indent + 2)
+                elif isinstance(v, list):
+                    lines.append(f"{pad}{_y_key(k)}:")
+                    for item in v:
+                        if isinstance(item, dict):
+                            lines.append(f"{pad}  -")
+                            self._emit_state(lines, item, indent + 4)
+                        else:
+                            lines.append(f"{pad}  - {_y_scalar(item)}")
+                else:
+                    lines.append(f"{pad}{_y_key(k)}: {_y_scalar(v)}")
