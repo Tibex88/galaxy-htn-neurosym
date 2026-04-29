@@ -50,9 +50,10 @@ PORT_RULES: dict[str, dict[str, Any]] = {
     "reference_source|ref": {
         "reference_source": {"reference_source_selector": "history"}
     },
-    "fastq_input|fastq_input1": {
-        "fastq_input": {"fastq_input_selector": "paired"}
-    },
+    # Note: BWA's `fastq_input|fastq_input1` is handled by
+    # `_infer_bwa_fastq_input` below because the selector value depends on
+    # whether the upstream produces a paired *collection* (e.g. fastp's
+    # output_paired_coll) or two separate datasets.
     "fastq_input|fastq_input2": {
         "fastq_input": {"fastq_input_selector": "paired"}
     },
@@ -135,6 +136,37 @@ DEFAULT_MULTIQC_SOFTWARE = ("custom_content", None, "none")
 
 _RESULTS_INDEX_RE = re.compile(r"^results_(\d+)\b")
 
+# Output-port substrings that imply the producer is emitting a paired
+# collection (one dataset that contains both R1 and R2 elements) — used
+# when the inference needs to pick between single-dataset and collection
+# modes on a downstream tool.
+_PAIRED_COLLECTION_OUTPUTS = ("paired_coll", "paired_collection", "_pair")
+
+
+def _is_paired_collection_producer(prod: tuple[str, str] | None) -> bool:
+    if not prod:
+        return False
+    upstream_port = (prod[1] or "").lower()
+    return any(s in upstream_port for s in _PAIRED_COLLECTION_OUTPUTS)
+
+
+def _infer_bwa_fastq_input(prod: tuple[str, str] | None) -> dict[str, Any]:
+    """
+    BWA-MEM (and bowtie2/minimap2 with the same conditional shape) uses
+    the SAME port name `fastq_input1` in both `paired` and
+    `paired_collection` modes — only the selector value differs:
+
+      paired             - fastq_input1 / fastq_input2 (two datasets)
+      paired_collection  - fastq_input1 (one paired collection)
+
+    Pick `paired_collection` when the upstream is producing a paired
+    collection (e.g. fastp.output_paired_coll); else default to `paired`.
+    """
+    selector = (
+        "paired_collection" if _is_paired_collection_producer(prod) else "paired"
+    )
+    return {"fastq_input": {"fastq_input_selector": selector}}
+
 
 def _multiqc_for(upstream_tool: str | None) -> tuple[str, str | None, str]:
     if not upstream_tool:
@@ -201,6 +233,10 @@ def infer_state(
 
     for flow in step_inputs:
         port = flow["port"]
+
+        if port == "fastq_input|fastq_input1":
+            _deep_merge(state, _infer_bwa_fastq_input(var_producer.get(flow["var"])))
+            continue
 
         if port in PORT_RULES:
             _deep_merge(state, PORT_RULES[port])
