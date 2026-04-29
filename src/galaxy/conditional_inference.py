@@ -268,8 +268,17 @@ def infer_state(
 
 
 # ---------------------------------------------------------------------------
-# Workflow-input type inference — paired collection vs single dataset
+# Workflow-input type / format / label inference
 # ---------------------------------------------------------------------------
+#
+# Galaxy's history-picker filters available datasets by `format:` declared
+# on the workflow input. Without it, the user can pick literally anything
+# (e.g. a MultiQC stats report into a GenBank slot), which won't fail at
+# import time but will fail at run time. Surfacing format + label + doc
+# also makes the runtime form self-documenting.
+#
+# Each entry maps a downstream consumer port to the formats / collection
+# shape / label / doc that Galaxy should display for that workflow input.
 
 # port name (lowercase) substrings that imply a paired collection
 _PAIRED_COLLECTION_HINTS = (
@@ -278,23 +287,75 @@ _PAIRED_COLLECTION_HINTS = (
     "paired_fastq",
     "fastq_pair",
 )
-
-# port name substrings that imply a generic collection (list)
-_COLLECTION_HINTS = (
-    "_collection",
-    "_set",
-    "input_list",
-)
+_COLLECTION_HINTS = ("_collection", "_set", "input_list")
 
 
-def infer_input_type(consumer_port: str) -> dict[str, str]:
+# Per-consumer-port spec: formats are taken verbatim from the upstream
+# tool wrapper's <param format="..."> in tools-iuc / tools-devteam.
+INPUT_PORT_SPEC: dict[str, dict[str, Any]] = {
+    "single_paired|paired_input": {
+        "format": ["fastqsanger.gz", "fastqsanger"],
+        "label": "Paired-end FASTQ reads (collection)",
+        "doc": (
+            "Build a paired list collection from your forward + reverse "
+            "FASTQ files. Element identifiers should be `forward` and "
+            "`reverse` (Galaxy default for paired list builds)."
+        ),
+    },
+    "single_paired|in1": {
+        "format": ["fastqsanger.gz", "fastqsanger"],
+        "label": "Single-end FASTQ reads",
+    },
+    "fastq_input|fastq_input1": {
+        "format": ["fastqsanger.gz", "fastqsanger", "fasta"],
+        "label": "Sequencing reads (FASTQ or FASTA)",
+    },
+    "reference_source|ref_file": {
+        "format": ["fasta"],
+        "label": "Reference genome (FASTA)",
+    },
+    "input_type|input_gbk": {
+        "format": ["genbank", "genbank.gz"],
+        "label": "Reference annotation (GenBank)",
+        "doc": (
+            "GenBank file used by SnpEff to build the variant-annotation "
+            "database for this organism."
+        ),
+    },
+    "snpDb|snpeff_db": {
+        "format": ["snpeffdb"],
+        "label": "SnpEff genome database",
+    },
+    "input1": {
+        "format": ["sam", "bam"],
+        "label": "SAM or BAM alignment",
+    },
+    "inputFile": {
+        "format": ["bam"],
+        "label": "Sorted BAM alignment",
+    },
+}
+
+
+def infer_input_type(consumer_port: str) -> dict[str, Any]:
     """
     Return a partial gxformat2 input spec for a workflow-level input,
-    based on the name of the first port that consumes it.
+    based on the name of the first port that consumes it. Includes
+    type/collection_type plus format/label/doc when known.
     """
-    p = consumer_port.lower()
-    if any(h in p for h in _PAIRED_COLLECTION_HINTS):
-        return {"type": "collection", "collection_type": "paired"}
-    if any(h in p for h in _COLLECTION_HINTS):
-        return {"type": "collection", "collection_type": "list"}
-    return {"type": "data"}
+    p_lower = consumer_port.lower()
+
+    # Start with collection-shape inference
+    if any(h in p_lower for h in _PAIRED_COLLECTION_HINTS):
+        spec: dict[str, Any] = {"type": "collection", "collection_type": "paired"}
+    elif any(h in p_lower for h in _COLLECTION_HINTS):
+        spec = {"type": "collection", "collection_type": "list"}
+    else:
+        spec = {"type": "data"}
+
+    # Layer per-port format / label / doc on top
+    extras = INPUT_PORT_SPEC.get(consumer_port)
+    if extras:
+        spec.update(extras)
+
+    return spec

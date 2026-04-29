@@ -156,10 +156,28 @@ class WorkflowCompiler:
         lines.append("inputs:")
         if workflow_inputs:
             for input_name, type_spec in workflow_inputs:
+                # NOTE: gxformat2 forbids both `label:` and an `id:`/dict key
+                # on the same input — they're aliases. The dict key IS the
+                # label, so we don't emit `label:` here. We DO emit format,
+                # doc, and the type/collection shape.
                 lines.append(f"  {_y_key(input_name)}:")
                 for k in ("type", "collection_type"):
                     if k in type_spec:
                         lines.append(f"    {k}: {type_spec[k]}")
+                fmts = type_spec.get("format")
+                if fmts:
+                    fmt_list = ", ".join(_y_str(f) for f in fmts)
+                    lines.append(f"    format: [{fmt_list}]")
+                # Combine label + doc into the doc field so users still see
+                # the human description in Galaxy's runtime form.
+                doc_parts = []
+                if "label" in type_spec:
+                    doc_parts.append(type_spec["label"])
+                if "doc" in type_spec:
+                    doc_parts.append(type_spec["doc"])
+                if doc_parts:
+                    combined = " — ".join(doc_parts)
+                    lines.append(f"    doc: {_y_str(combined)}")
         else:
             lines.append("  input_dataset:")
             lines.append("    type: data")
