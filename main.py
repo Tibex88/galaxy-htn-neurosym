@@ -88,6 +88,11 @@ def _cmd_query(args, reasoner):
         plans,
         workflow_name=args.name or "htn_generated_workflow",
         annotation=f"Generated from query: {parsed.raw_query!r}",
+        context={
+            "organism": parsed.organism,
+            "raw_query": parsed.raw_query,
+            "inputs": parsed.inputs,
+        },
     )
     print("\n[3/3] COMPILED")
     print(f"  {len(compiled.tool_ids)} tool steps")

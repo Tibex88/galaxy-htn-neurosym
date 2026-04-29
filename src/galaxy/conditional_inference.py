@@ -155,11 +155,33 @@ def _deep_merge(dst: dict, src: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _snpeff_genome_version(context: dict) -> str:
+    """
+    SnpEff create_db requires a free-text database NAME (validator rejects
+    empty). Galaxy sanitises the field so spaces become underscores. We
+    pick the parsed organism when available, else a safe placeholder the
+    user can rename in the editor.
+    """
+    organism = (context.get("organism") or "").strip().lower()
+    if organism:
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", organism).strip("_") or "custom_db"
+    return "custom_db"
+
+
+# Tool-keyed defaults that don't depend on input ports — e.g. free-text
+# fields that have validators rejecting empty values. Each entry is a
+# callable that receives the inference context and returns a state delta.
+TOOL_DEFAULTS: dict[str, Any] = {
+    "SnpEff_build_": lambda ctx: {"genome_version": _snpeff_genome_version(ctx)},
+}
+
+
 def infer_state(
     *,
     tool: str,
     step_inputs: list[dict],
     var_producer: dict[str, tuple[str, str]],
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Return the state dict to emit under a step's `state:` block based on
@@ -168,8 +190,14 @@ def infer_state(
     `step_inputs` are records like {port, var}. `var_producer[var]` is
     `(upstream_tool, output_port)` when the var is produced inside the
     same plan, or absent when the var becomes a workflow-level input.
+    `context` carries pipeline-wide info (parsed organism, query hints)
+    used by tool-specific defaults.
     """
     state: dict[str, Any] = {}
+    ctx = context or {}
+
+    if tool in TOOL_DEFAULTS:
+        _deep_merge(state, TOOL_DEFAULTS[tool](ctx))
 
     for flow in step_inputs:
         port = flow["port"]

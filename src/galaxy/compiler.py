@@ -106,6 +106,7 @@ class WorkflowCompiler:
         plans: list[Plan],
         workflow_name: str = "htn_generated_workflow",
         annotation: str = "",
+        context: dict | None = None,
     ) -> CompiledWorkflow:
         all_tool_ids: list[str] = []
         missing_full_ids: list[str] = []
@@ -233,6 +234,7 @@ class WorkflowCompiler:
                     tool=tool,
                     step_inputs=this_step_inputs,
                     var_producer=var_producer_by_tool,
+                    context=context,
                 )
                 if state:
                     lines.append("    state:")
