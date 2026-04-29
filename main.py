@@ -111,6 +111,27 @@ def _cmd_query(args, reasoner):
     path = compiled.write(out_path)
     print(f"  wrote gxformat2 YAML -> {path}")
 
+    # Convert to Galaxy native .ga and post-process so the importer
+    # accepts it (gxwf-to-native leaves required fields blank).
+    ga_path = path.with_suffix("") if str(path).endswith(".gxwf.yml") else path.with_suffix(".ga")
+    ga_path = path.parent / (path.stem.removesuffix(".gxwf") + ".ga")
+    try:
+        import subprocess
+        subprocess.run(
+            [".venv/bin/gxwf-to-native", str(path), str(ga_path)],
+            check=True, capture_output=True,
+        )
+        from scripts.postprocess_ga import fix_workflow, _load_tool_meta
+        import json as _json
+        ga = _json.loads(ga_path.read_text())
+        fixed = fix_workflow(ga, _load_tool_meta())
+        ga_path.write_text(_json.dumps(fixed, indent=4))
+        print(f"  wrote Galaxy native .ga    -> {ga_path}")
+    except FileNotFoundError:
+        print("  (skipping .ga conversion — gxwf-to-native not on path)")
+    except subprocess.CalledProcessError as e:
+        print(f"  warning: gxwf-to-native failed: {e.stderr.decode()[:200]}")
+
 
 def _cmd_feedback(args, reasoner):
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
