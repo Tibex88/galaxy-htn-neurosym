@@ -82,46 +82,61 @@ PORT_RULES: dict[str, dict[str, Any]] = {
 # MultiQC software_cond — discriminator depends on upstream producer
 # ---------------------------------------------------------------------------
 
-# upstream tool (safe_name) -> (software_value, output_type_value | None)
-# software_value: discriminator for software_cond.software
-# output_type_value: discriminator for software_cond.output[0].type.type when
-#   the software branch has a nested type conditional. None means the branch
-#   has only a flat input port (no deeper conditional).
-MULTIQC_BY_UPSTREAM: dict[str, tuple[str, str | None]] = {
-    # fastp branch — single 'input' port, no nested type
-    "fastp": ("fastp", None),
-    "FastQC": ("fastqc", None),
-    # samtools branch — output[0].type.type selects stats|flagstat|idxstats
-    "Samtools_stats": ("samtools", "stats"),
-    "Samtools_flagstat": ("samtools", "flagstat"),
-    "Samtools_idxstats": ("samtools", "idxstats"),
-    # picard branch — output[0].type.type selects MarkDuplicates|InsertSize|...
-    "MarkDuplicates": ("picard", "markdups"),
-    "Picard_MarkDuplicates": ("picard", "markdups"),
-    "Picard_CollectInsertSizeMetrics": ("picard", "insertsize"),
-    # other tools — flat
-    "Bowtie2": ("bowtie2", None),
-    "HISAT2": ("hisat2", None),
-    "STAR": ("star", None),
-    "salmon": ("salmon", None),
-    "Salmon_quant": ("salmon", None),
-    "kallisto_quant": ("kallisto", None),
-    "RSeQC_bam_stat": ("rseqc", None),
-    "trimmomatic": ("trimmomatic", None),
-    "Trim_Galore": ("cutadapt", None),
-    "Cutadapt": ("cutadapt", None),
-    "SnpEff_eff_": ("snpeff", None),
-    "SnpEff_eff": ("snpeff", None),
-    "featureCounts": ("featurecounts", None),
-    "Tophat2": ("tophat", None),
+# Upstream tool (safe_name) -> (software, output_type, output_kind)
+#   software:    discriminator value for software_cond.software
+#   output_type: discriminator value for the per-output `type` selector
+#                  inside the software_cond branch (None for branches that
+#                  expose `input` directly without an `output` repeat).
+#   output_kind: how the per-output `type` is shaped inside the branch:
+#                  "none"      — branch has no `output` repeat (input is flat)
+#                  "select"    — `output[N].type = "<value>"` (flat select)
+#                                e.g. picard branch
+#                  "conditional" — `output[N].type = {"type": "<value>"}`
+#                                  (nested conditional whose selector is also
+#                                  named `type`) e.g. samtools, rseqc
+#
+# Verified against tools-iuc/tools/multiqc/macros.xml.
+MULTIQC_BY_UPSTREAM: dict[str, tuple[str, str | None, str]] = {
+    # fastp branch — single `input` port, no `output` repeat
+    "fastp": ("fastp", None, "none"),
+    "FastQC": ("fastqc", None, "none"),
+    # picard branch — output[N].type is a FLAT select param
+    "MarkDuplicates": ("picard", "markdups", "select"),
+    "Picard_MarkDuplicates": ("picard", "markdups", "select"),
+    "Picard_CollectInsertSizeMetrics": ("picard", "insertsize", "select"),
+    "Picard_CollectGcBias": ("picard", "gcbias", "select"),
+    "Picard_CollectRnaSeqMetrics": ("picard", "rnaseqmetrics", "select"),
+    "Picard_CollectAlignmentSummaryMetrics": ("picard", "alignment_metrics", "select"),
+    "Picard_CollectBaseDistributionByCycle": ("picard", "basedistributionbycycle", "select"),
+    # samtools branch — output[N].type is a CONDITIONAL whose selector is type
+    "Samtools_stats": ("samtools", "stats", "conditional"),
+    "Samtools_flagstat": ("samtools", "flagstat", "conditional"),
+    "Samtools_idxstats": ("samtools", "idxstats", "conditional"),
+    # rseqc branch — same nested-conditional shape as samtools
+    "RSeQC_bam_stat": ("rseqc", "bam_stat", "conditional"),
+    "RSeQC_read_GC": ("rseqc", "read_gc", "conditional"),
+    # branches with a flat input directly under software_cond
+    "Bowtie2": ("bowtie2", None, "none"),
+    "HISAT2": ("hisat2", None, "none"),
+    "STAR": ("star", None, "none"),
+    "salmon": ("salmon", None, "none"),
+    "Salmon_quant": ("salmon", None, "none"),
+    "kallisto_quant": ("kallisto", None, "none"),
+    "trimmomatic": ("trimmomatic", None, "none"),
+    "Trim_Galore": ("cutadapt", None, "none"),
+    "Cutadapt": ("cutadapt", None, "none"),
+    "SnpEff_eff_": ("snpeff", None, "none"),
+    "SnpEff_eff": ("snpeff", None, "none"),
+    "featureCounts": ("featurecounts", None, "none"),
+    "Tophat2": ("tophat", None, "none"),
 }
 
-DEFAULT_MULTIQC_SOFTWARE = ("custom_content", None)
+DEFAULT_MULTIQC_SOFTWARE = ("custom_content", None, "none")
 
 _RESULTS_INDEX_RE = re.compile(r"^results_(\d+)\b")
 
 
-def _multiqc_for(upstream_tool: str | None) -> tuple[str, str | None]:
+def _multiqc_for(upstream_tool: str | None) -> tuple[str, str | None, str]:
     if not upstream_tool:
         return DEFAULT_MULTIQC_SOFTWARE
     return MULTIQC_BY_UPSTREAM.get(upstream_tool, DEFAULT_MULTIQC_SOFTWARE)
@@ -168,16 +183,20 @@ def infer_state(
             idx = int(idx_match.group(1))
             prod = var_producer.get(flow["var"])
             upstream = prod[0] if prod else None
-            software, output_type = _multiqc_for(upstream)
+            software, output_type, output_kind = _multiqc_for(upstream)
 
             results = state.setdefault("results", [])
             while len(results) <= idx:
                 results.append({})
-            sw_cond = {"software": software}
-            # Software branches that wrap their data port inside a nested
-            # `output[0].type.type` conditional need that discriminator too,
-            # otherwise Galaxy renders the wrapping ports red.
-            if output_type:
+            sw_cond: dict[str, Any] = {"software": software}
+            if output_kind == "select" and output_type is not None:
+                # picard branch — `type` is a FLAT select param. State shape:
+                #   output: [{type: "markdups"}]
+                sw_cond["output"] = [{"type": output_type}]
+            elif output_kind == "conditional" and output_type is not None:
+                # samtools / rseqc branch — `type` is a NESTED conditional
+                # whose selector is also named `type`. State shape:
+                #   output: [{type: {type: "stats"}}]
                 sw_cond["output"] = [{"type": {"type": output_type}}]
             _deep_merge(results[idx], {"software_cond": sw_cond})
 
